@@ -1,0 +1,344 @@
+#!/bin/bash
+# /*
+#  * igpu-freqd: intel igpu dynamic frequency scaling daemon
+#  * focuses on thermal management and load-based frequency adjustment
+#  */
+
+set -o pipefail
+
+# /*
+#  * default configuration parameters
+#  */
+POLL_RATE=0.2
+TEMP_LIMIT_C=90
+HYSTERESIS=30
+INTEL_GPU_TOP_TIMEOUT=0.3
+INTEL_GPU_TOP_SAMPLES=100
+FALLBACK_FREQ_MHZ=800
+MAX_FAILURES=3
+SMOOTHING_WINDOW=5
+ALPHA_TEMP=0.3
+SLEW_RATE_LIMIT=80
+THERMAL_DECAY_FACTOR=0.05
+LOG_LEVEL=1
+HEARTBEAT_CYCLES=10
+
+# /*
+#  * configuration loading from /etc/igpu-freqd.conf
+#  */
+CONFIG_FILE="/etc/igpu-freqd.conf"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS='=' read -r key val; do
+        # /* clean key and value strings */
+        key=$(echo "$key" | xargs)
+        val=$(echo "$val" | xargs)
+
+        # /* skip empty lines and comments */
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+
+        # /* validate and export configuration variables */
+        if [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+            printf -v "$key" "%s" "$val"
+        else
+            echo "[warn] ignored invalid config key: $key" >&2
+        fi
+    done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep -v '^[[:space:]]*$')
+fi
+
+# /*
+#  * logging and signal handling utilities
+#  */
+log() {
+    local level="$1"
+    shift
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+}
+
+cleanup() {
+    log info "received termination signal, exiting cleanly"
+    exit 0
+}
+
+trap cleanup sigterm sigint
+
+# /*
+#  * hardware detection and sysfs path resolution
+#  */
+find_gpu_dir() {
+    local card_dir=""
+    for card in /sys/class/drm/card*; do
+        # /* skip virtual or sub-devices */
+        [[ "$card" =~ - ]] && continue
+
+        # /* verify intel vendor id (0x8086) */
+        if [[ -f "$card/device/vendor" ]] && grep -qi "0x8086" "$card/device/vendor" 2>/dev/null; then
+            # /* ensure frequency control files exist */
+            if [[ -f "$card/gt_min_freq_mhz" ]] && [[ -f "$card/gt_max_freq_mhz" ]]; then
+                card_dir="$card"
+                break
+            fi
+        fi
+    done
+    echo "$card_dir"
+}
+
+GPU_DIR=$(find_gpu_dir)
+
+if [[ -z "$GPU_DIR" ]]; then
+    log error "no compatible intel gpu found, aborting"
+    exit 1
+fi
+
+GPU_MIN_FREQ="$GPU_DIR/gt_min_freq_mhz"
+GPU_MAX_FREQ="$GPU_DIR/gt_max_freq_mhz"
+GPU_ACT_FREQ="$GPU_DIR/gt_act_freq_mhz"
+
+read_freq_limit() {
+    local file="$1" 
+    local fallback="$2" 
+    local val
+
+    val=$(cat "$file" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$val" || "$val" -eq 0 ]]; then 
+        echo "$fallback"
+    else 
+        echo "$val"
+    fi
+}
+
+MAX_FREQ=$(read_freq_limit "$GPU_DIR/gt_max_freq_mhz" 1100)
+BASE_FREQ=$(read_freq_limit "$GPU_DIR/gt_RPn_freq_mhz" 300)
+
+if [[ "$MAX_FREQ" -lt "$BASE_FREQ" ]]; then
+    log warn "max_freq < base_freq, adjusting values"
+    MAX_FREQ=$BASE_FREQ
+fi
+
+log info "gpu detected: $GPU_DIR, base=${BASE_FREQ}mhz, max=${MAX_FREQ}mhz"
+
+# /*
+#  * thermal management and sensor discovery
+#  */
+find_thermal_sensor() {
+    local sensor=""
+    for zone in /sys/class/thermal/thermal_zone*; do
+        if [[ -f "$zone/type" ]]; then
+            local type
+            type=$(cat "$zone/type" 2>/dev/null | tr -d '[:space:]')
+            # /* prioritize x86 package temperature */
+            if [[ "$type" = "x86_pkg_temp" ]]; then
+                sensor="$zone/temp"
+                break
+            fi
+        fi
+    done
+
+    # /* fallback to generic thermal zone 0 */
+    [[ -z "$sensor" ]] && [[ -f "/sys/class/thermal/thermal_zone0/temp" ]] && sensor="/sys/class/thermal/thermal_zone0/temp"
+    echo "$sensor"
+}
+
+THERMAL_SENSOR=$(find_thermal_sensor)
+[[ -z "$THERMAL_SENSOR" ]] && log warn "no thermal sensor found, using 40°c fallback"
+
+# /*
+#  * gpu load telemetry collection
+#  */
+read_gpu_load() {
+    local load=""
+
+    # /* method 1: intel_gpu_top text mode */
+    if command -v intel_gpu_top &>/dev/null; then
+        local output
+        output=$(timeout "$INTEL_GPU_TOP_TIMEOUT" intel_gpu_top -s "$INTEL_GPU_TOP_SAMPLES" 2>/dev/null)
+        if [[ -n "$output" ]]; then
+            # /* extract render/3d percentage */
+            load=$(echo "$output" | grep -A 1 "Render/3D" | tail -n 1 | awk '{print $2}' | tr -d ' %')
+            if [[ -n "$load" ]] && [[ "$load" -ge 0 ]] 2>/dev/null; then
+                echo "$load"
+                return
+            fi
+        fi
+    fi
+
+    # /* method 2: active frequency fallback */
+    if [[ -f "$GPU_ACT_FREQ" ]]; then
+        local act_freq
+        act_freq=$(cat "$GPU_ACT_FREQ" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$act_freq" ]] && [[ "$act_freq" -gt 0 ]]; then
+            # /* estimate load based on current vs max frequency */
+            local load_est
+            load_est=$(awk -v act="$act_freq" -v base="$BASE_FREQ" -v max="$MAX_FREQ" '
+                BEGIN {
+                    if (max == base) { print 0; exit; }
+                    load = ((act - base) / (max - base)) * 100;
+                    if (load > 100) load = 100;
+                    if (load < 0) load = 0;
+                    printf "%.0f", load;
+                }')
+            echo "$load_est"
+            return
+        fi
+    fi
+
+    # /* return empty on total failure */
+    echo ""
+}
+
+# /*
+#  * main execution loop
+#  */
+log info "starting main loop (poll=${POLL_RATE}s, hyst=${HYSTERESIS}mhz, limit=${TEMP_LIMIT_C}°c, log=${LOG_LEVEL})"
+
+last_freq=-1
+failure_count=0
+current_freq=$BASE_FREQ
+load_history=()
+window=$SMOOTHING_WINDOW
+temp_smooth=40
+cycle_count=0
+
+# /* zero-load validation state */
+raw_history=()
+last_valid_raw=0
+
+while true; do
+    cycle_count=$((cycle_count + 1))
+
+    # /* temperature processing */
+    temp_raw=$(cat "$THERMAL_SENSOR" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$temp_raw" ]]; then 
+        temp_raw=40
+    else 
+        temp_raw=$((temp_raw / 1000))
+    fi
+
+    temp_smooth=$(awk -v alpha="$ALPHA_TEMP" -v prev="$temp_smooth" -v raw="$temp_raw" '
+        BEGIN { printf "%.1f", alpha*raw + (1-alpha)*prev }')
+    temp_int=${temp_smooth%.*}
+
+    # /* load telemetry with zero-validation */
+    raw=$(read_gpu_load)
+
+    if [[ -z "$raw" ]]; then
+        failure_count=$((failure_count + 1))
+        log warn "failed to read gpu load (attempt $failure_count/$MAX_FAILURES)"
+        
+        if [[ $failure_count -ge $MAX_FAILURES ]]; then
+            log warn "too many failures, applying fallback ${FALLBACK_FREQ_MHZ}mhz"
+            target_freq=$FALLBACK_FREQ_MHZ
+            
+            if [[ "$target_freq" -ne "$last_freq" ]] || [[ "$last_freq" -eq -1 ]]; then
+                echo "$target_freq" > "$GPU_MIN_FREQ" 2>/dev/null && last_freq=$target_freq
+                log info "fallback applied: freq=${target_freq}mhz"
+            fi
+            failure_count=0
+        fi
+        
+        sleep "$POLL_RATE"
+        continue
+    else
+        failure_count=0
+    fi
+
+    # /* update raw history buffer */
+    raw_history+=("$raw")
+    if [[ ${#raw_history[@]} -gt 5 ]]; then
+        raw_history=("${raw_history[@]:1}")
+    fi
+
+    # /* confirm if zero-load is sustained */
+    if [[ "$raw" -eq 0 ]] 2>/dev/null; then
+        zero_count=0
+        for val in "${raw_history[@]}"; do
+            [[ "$val" -eq 0 ]] 2>/dev/null && zero_count=$((zero_count + 1))
+        done
+        
+        if [[ $zero_count -ge 3 ]]; then
+            gpu_load_raw=0
+        else
+            # /* use last known valid reading */
+            if [[ -n "$last_valid_raw" && "$last_valid_raw" -ne 0 ]]; then
+                gpu_load_raw=$last_valid_raw
+            else
+                gpu_load_raw=0
+            fi
+        fi
+    else
+        gpu_load_raw=$raw
+        last_valid_raw=$raw
+    fi
+
+    # /* moving average calculation */
+    load_history+=("$gpu_load_raw")
+    if [[ ${#load_history[@]} -gt $window ]]; then
+        load_history=("${load_history[@]:1}")
+    fi
+    
+    gpu_load_avg=$(printf "%s\n" "${load_history[@]}" | awk '{sum+=$1} END {if(NR>0) printf "%.1f", sum/NR; else print "0"}')
+
+    # /* target frequency algorithm calculation */
+    target_freq=$(awk -v gpu_load="$gpu_load_avg" -v temp="$temp_int" \
+                     -v base="$BASE_FREQ" -v max="$MAX_FREQ" \
+                     -v t_limit="$TEMP_LIMIT_C" \
+                     -v decay_factor="$THERMAL_DECAY_FACTOR" '
+        BEGIN {
+            if (max <= base) { printf "%d\n", base; exit; }
+            a = (max - base) / log(101);
+            f_load = base + (a * log(gpu_load + 1));
+            if (f_load > max) f_load = max;
+            if (f_load < base) f_load = base;
+            
+            if (temp > t_limit) {
+                decay = exp(-decay_factor * (temp - t_limit));
+                f_final = base + ((f_load - base) * decay);
+            } else {
+                f_final = f_load;
+            }
+            
+            if (f_final > max) f_final = max;
+            if (f_final < base) f_final = base;
+            printf "%d\n", f_final;
+        }'
+    )
+
+    # /* apply hysteresis and slew rate limits */
+    apply_change=0
+    if [[ "$last_freq" -eq -1 ]]; then
+        apply_change=1
+    elif [[ $((target_freq - last_freq)) -gt $HYSTERESIS ]] || [[ $((last_freq - target_freq)) -gt $HYSTERESIS ]]; then
+        apply_change=1
+    fi
+
+    if [[ $apply_change -eq 1 ]]; then
+        if [[ "$last_freq" -ne -1 ]]; then
+            diff=$((target_freq - last_freq))
+            if [[ $diff -gt $SLEW_RATE_LIMIT ]]; then
+                target_freq=$((last_freq + SLEW_RATE_LIMIT))
+            elif [[ $((-diff)) -gt $SLEW_RATE_LIMIT ]]; then
+                target_freq=$((last_freq - SLEW_RATE_LIMIT))
+            fi
+        fi
+        
+        [[ "$target_freq" -lt "$BASE_FREQ" ]] && target_freq=$BASE_FREQ
+        [[ "$target_freq" -gt "$MAX_FREQ" ]] && target_freq=$MAX_FREQ
+
+        if echo "$target_freq" > "$GPU_MIN_FREQ" 2>/dev/null; then
+            last_freq=$target_freq
+            current_freq=$target_freq
+            log info "applied freq=${target_freq}mhz (load_avg=${gpu_load_avg}%, temp=${temp_int}°c, raw=${gpu_load_raw}%)"
+        else
+            log error "failed to write to $GPU_MIN_FREQ"
+        fi
+    else
+        # /* periodic heartbeat or debug logging */
+        if [[ "$LOG_LEVEL" -ge 2 ]]; then
+            log debug "no change: target=${target_freq}mhz, last=${last_freq}mhz, load=${gpu_load_avg}%, temp=${temp_int}°c"
+        elif [[ "$LOG_LEVEL" -eq 1 && $((cycle_count % HEARTBEAT_CYCLES)) -eq 0 ]]; then
+            log info "heartbeat: freq=${last_freq}mhz, load_avg=${gpu_load_avg}%, temp=${temp_int}°c, raw=${gpu_load_raw}%"
+        fi
+    fi
+
+    sleep "$POLL_RATE"
+done
