@@ -50,18 +50,19 @@ curl -fsSL https://raw.githubusercontent.com/edusbarbosa/igpu-freqd/main/install
 
 | Parâmetro | Valor padrão | Descrição |
 |-----------|---------------|-----------|
-| `POLL_RATE` | `0.2` | Intervalo, em segundos, para fazer a leitura da carga na GPU. |
+| `POLL_RATE` | `0.4` | Intervalo, em segundos, para fazer a leitura da carga na GPU. |
 | `TEMP_LIMIT_C` | `90` | Limite de temperatura, em graus Celsius, que será aplicado no cálculo matemático da compensação térmica. |
 | `HYSTERESIS` | `30` | Limiar mínimo, em MHz, que o clock atual deve possuir na diferença absoluta com a nova frequência-alvo para aplicar a mudança. |
 | `INTEL_GPU_TOP_TIMEOUT` | `0.3` | Tempo máximo de espera, em segundos, para a leitura do comando `intel_gpu_top` antes de abortar (`timeout`). |
 | `INTEL_GPU_TOP_SAMPLES` | `100` | Quantidade de amostras coletadas pelo `intel_gpu_top` durante a leitura para definir o uso da GPU. |
 | `FALLBACK_FREQ_MHZ` | `800` | Frequência de segurança, em MHz, que será aplicada caso o script falhe repetidamente ao tentar ler a carga da placa. |
+| `FALLBACK_TEMP_C` | `40` | Temperatura de segurança, em graus Celsius, usada como limite de fallback quando o script não consegue ler a carga da placa e precisa evitar o superaquecimento. |
 | `MAX_FAILURES` | `3` | Número máximo de falhas consecutivas de leitura toleradas antes de acionar a frequência de segurança (`fallback`). |
 | `SMOOTHING_WINDOW` | `5` | Tamanho da janela (número de ciclos) usada para calcular a média móvel da carga da GPU, ignorando picos irreais curtos. |
 | `ALPHA_TEMP` | `0.3` | Fator de suavização (de 0 a 1) da média móvel exponencial da temperatura, evitando que o script reaja a oscilações bruscas do sensor. |
-| `SLEW_RATE_LIMIT` | `80` | Limite máximo, em MHz, que o clock pode subir ou descer em um único ciclo, forçando uma aceleração/desaceleração suave. |
+| `SLEW_RATE_LIMIT` | `100` | Limite máximo, em MHz, que o clock pode subir ou descer em um único ciclo, forçando uma aceleração/desaceleração suave. |
 | `THERMAL_DECAY_FACTOR` | `0.05` | Fator multiplicador da fórmula exponencial, que dita a agressividade do corte de clock ao ultrapassar o limite de temperatura. |
-| `LOG_LEVEL` | `1` | Nível de detalhamento dos registros enviados ao `journalctl` (ex: `1` para resumos de operação, `2` para debug completo). |
+| `LOG_LEVEL` | `0` | Nível de detalhamento dos registros enviados ao `journalctl` (`0` para logs apenas de mudanças, `1` para resumos de heartbeat, `2` para debug completo). |
 | `HEARTBEAT_CYCLES` | `10` | Quantidade de ciclos consecutivos sem alterações de clock necessários para emitir um log de "sinal de vida" mostrando que o script não travou. |
 
 ## Desinstalação

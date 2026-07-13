@@ -89,7 +89,7 @@ if [ ! -f "/etc/igpu-freqd.conf" ]; then
 #  * igpu-freqd configuration
 #  * all values are in seconds, mhz or celsius
 #  */
-POLL_RATE=0.2
+POLL_RATE=0.4
 TEMP_LIMIT_C=90
 HYSTERESIS=30
 INTEL_GPU_TOP_TIMEOUT=0.3
@@ -98,13 +98,14 @@ FALLBACK_FREQ_MHZ=800
 MAX_FAILURES=3
 SMOOTHING_WINDOW=5
 ALPHA_TEMP=0.3
-SLEW_RATE_LIMIT=80
+SLEW_RATE_LIMIT=100
 THERMAL_DECAY_FACTOR=0.05
+FALLBACK_TEMP_C=40
 
 # /*
 #  * log_level: 0=changes, 1=heartbeat (every n cycles), 2=verbose
 #  */
-LOG_LEVEL=1
+LOG_LEVEL=0
 HEARTBEAT_CYCLES=10
 EOF
     chmod 644 /etc/igpu-freqd.conf

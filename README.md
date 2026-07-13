@@ -51,18 +51,19 @@ curl -fsSL https://raw.githubusercontent.com/edusbarbosa/igpu-freqd/main/install
 
 | Parameter | Default value | Description |
 |-----------|---------------|-------------|
-| `POLL_RATE` | `0.2` | Interval, in seconds, to read the GPU load. |
+| `POLL_RATE` | `0.4` | Interval, in seconds, to read the GPU load. |
 | `TEMP_LIMIT_C` | `90` | Temperature limit, in degrees Celsius, applied in the thermal compensation calculation. |
 | `HYSTERESIS` | `30` | Minimum threshold, in MHz, that the current clock must differ from the new target frequency by to apply the change. |
 | `INTEL_GPU_TOP_TIMEOUT` | `0.3` | Maximum waiting time, in seconds, to read the `intel_gpu_top` command before aborting (`timeout`). |
 | `INTEL_GPU_TOP_SAMPLES` | `100` | Number of samples collected by `intel_gpu_top` while reading to determine GPU usage. |
 | `FALLBACK_FREQ_MHZ` | `800` | Safety frequency, in MHz, applied if the script repeatedly fails while trying to read the card load. |
+| `FALLBACK_TEMP_C` | `40` | Temperature threshold, in degrees Celsius, used as a fallback limit when the script cannot read the card load and needs to prevent overheating. |
 | `MAX_FAILURES` | `3` | Maximum number of consecutive read failures tolerated before triggering the fallback. |
 | `SMOOTHING_WINDOW` | `5` | Window size (number of cycles) used to calculate the moving average of the GPU load, ignoring short unreal peaks. |
 | `ALPHA_TEMP` | `0.3` | Smoothing factor (from 0 to 1) of the temperature exponential moving average, preventing the script from reacting to sudden sensor oscillations. |
-| `SLEW_RATE_LIMIT` | `80` | Maximum limit, in MHz, that the clock can increase or decrease in a single cycle, forcing smooth acceleration/deceleration. |
+| `SLEW_RATE_LIMIT` | `100` | Maximum limit, in MHz, that the clock can increase or decrease in a single cycle, forcing smooth acceleration/deceleration. |
 | `THERMAL_DECAY_FACTOR` | `0.05` | Multiplier factor of the exponential formula, which defines the aggressiveness of the clock cutoff when the temperature limit is exceeded. |
-| `LOG_LEVEL` | `1` | Detail level of the logs sent to `journalctl` (for example, `1` for operation summaries, `2` for full debug). |
+| `LOG_LEVEL` | `0` | Detail level of the logs sent to `journalctl` (`0` for change-only logs, `1` for heartbeat summaries, `2` for full debug). |
 | `HEARTBEAT_CYCLES` | `10` | Number of consecutive cycles without clock changes required to emit a "heartbeat" log showing that the script has not crashed. |
 
 ## Uninstall

@@ -9,7 +9,7 @@ set -o pipefail
 # /*
 #  * default configuration parameters
 #  */
-POLL_RATE=0.2
+POLL_RATE=0.4
 TEMP_LIMIT_C=90
 HYSTERESIS=30
 INTEL_GPU_TOP_TIMEOUT=0.3
@@ -18,10 +18,11 @@ FALLBACK_FREQ_MHZ=800
 MAX_FAILURES=3
 SMOOTHING_WINDOW=5
 ALPHA_TEMP=0.3
-SLEW_RATE_LIMIT=80
+SLEW_RATE_LIMIT=100
 THERMAL_DECAY_FACTOR=0.05
-LOG_LEVEL=1
+LOG_LEVEL=0
 HEARTBEAT_CYCLES=10
+FALLBACK_TEMP_C=40
 
 # /*
 #  * configuration loading from /etc/igpu-freqd.conf
@@ -44,7 +45,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
             echo "[warn] ignored invalid config key: $key" >&2
         fi
     done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep -v '^[[:space:]]*$')
-fi
+fi  
 
 # /*
 #  * logging and signal handling utilities
@@ -99,11 +100,16 @@ read_freq_limit() {
     local fallback="$2" 
     local val
 
-    val=$(cat "$file" 2>/dev/null | tr -d '[:space:]')
-    if [[ -z "$val" || "$val" -eq 0 ]]; then 
-        echo "$fallback"
+    if read -r val < "$file" 2>/dev/null; then 
+        val="${val//[[:space:]]/}"
+        
+        if [[ -z "$val" || "$val" -eq 0 ]]; then 
+            echo "$fallback"
+        else 
+            echo "$val"
+        fi
     else 
-        echo "$val"
+        echo "$fallback"
     fi
 }
 
@@ -154,7 +160,7 @@ read_gpu_load() {
         output=$(timeout "$INTEL_GPU_TOP_TIMEOUT" intel_gpu_top -s "$INTEL_GPU_TOP_SAMPLES" 2>/dev/null)
         if [[ -n "$output" ]]; then
             # /* extract render/3d percentage */
-            load=$(echo "$output" | grep -A 1 "Render/3D" | tail -n 1 | awk '{print $2}' | tr -d ' %')
+            load=$(echo "$output" | awk '/Render\/3D/ {getline; gsub(/[ %]/, "", $2); print $2}')
             if [[ -n "$load" ]] && [[ "$load" -ge 0 ]] 2>/dev/null; then
                 echo "$load"
                 return
@@ -207,11 +213,16 @@ while true; do
     cycle_count=$((cycle_count + 1))
 
     # /* temperature processing */
-    temp_raw=$(cat "$THERMAL_SENSOR" 2>/dev/null | tr -d '[:space:]')
-    if [[ -z "$temp_raw" ]]; then 
-        temp_raw=40
-    else 
-        temp_raw=$((temp_raw / 1000))
+    if read -r temp_raw < "$THERMAL_SENSOR" 2>/dev/null; then
+        temp_raw="${temp_raw//[[:space:]]/}"
+        
+        if [[ -z "$temp_raw" ]]; then
+            temp_raw=$FALLBACK_TEMP_C
+        else
+            temp_raw=$((temp_raw / 1000))
+        fi
+    else
+        temp_raw=$FALLBACK_TEMP_C
     fi
 
     temp_smooth=$(awk -v alpha="$ALPHA_TEMP" -v prev="$temp_smooth" -v raw="$temp_raw" '
@@ -271,10 +282,7 @@ while true; do
     fi
 
     # /* moving average calculation */
-    load_history+=("$gpu_load_raw")
-    if [[ ${#load_history[@]} -gt $window ]]; then
-        load_history=("${load_history[@]:1}")
-    fi
+    load_history[$((cycle_count % window))]="$gpu_load_raw"
     
     gpu_load_avg=$(printf "%s\n" "${load_history[@]}" | awk '{sum+=$1} END {if(NR>0) printf "%.1f", sum/NR; else print "0"}')
 
